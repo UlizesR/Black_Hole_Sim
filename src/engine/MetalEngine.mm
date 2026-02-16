@@ -7,10 +7,11 @@
 #import <GLFW/glfw3native.h>
 
 #include "MetalEngine.hpp"
+#include "GraphicsCommon.hpp"
+#include "UniformUpload.hpp"
 #include "../scene/Scene.hpp"
 #include <vector>
 #include <array>
-#include <span>
 #include <memory>
 #include <cmath>
 #include <iostream>
@@ -18,16 +19,7 @@
 #include <random>
 #include <glm/glm.hpp>
 
-// ===== Constants =====
-// C++17: inline constexpr for header-safe constants
-inline constexpr int MAX_FRAMES_IN_FLIGHT = 3;
-
-// C++11: constexpr functions for compile-time computation
-constexpr size_t alignTo256(size_t size) noexcept {
-    return (size + 255) & ~size_t(255);
-}
-
-// Buffer alignment: 256 bytes for macOS (computed at compile time)
+// ===== Metal-specific buffer alignment (256 bytes for macOS uniform buffers) =====
 inline constexpr size_t alignedCameraUBOSize  = alignTo256(sizeof(CameraUBO));
 inline constexpr size_t alignedDiskUBOSize    = alignTo256(sizeof(DiskUBO));
 inline constexpr size_t alignedObjectsUBOSize = alignTo256(sizeof(ObjectsUBO));
@@ -65,11 +57,10 @@ struct MetalEngine::Impl {
     id<MTLRenderPipelineState> gridPSO = nil;
     id<MTLRenderPipelineState> starsPSO = nil;
 
-    // C++11: std::array for type-safe fixed-size buffers
-    std::array<id<MTLBuffer>, MAX_FRAMES_IN_FLIGHT> cameraBuf;
-    std::array<id<MTLBuffer>, MAX_FRAMES_IN_FLIGHT> diskBuf;
-    std::array<id<MTLBuffer>, MAX_FRAMES_IN_FLIGHT> objectsBuf;
-    std::array<id<MTLBuffer>, MAX_FRAMES_IN_FLIGHT> gravityBuf;
+    std::array<id<MTLBuffer>, Graphics::MAX_FRAMES_IN_FLIGHT> cameraBuf;
+    std::array<id<MTLBuffer>, Graphics::MAX_FRAMES_IN_FLIGHT> diskBuf;
+    std::array<id<MTLBuffer>, Graphics::MAX_FRAMES_IN_FLIGHT> objectsBuf;
+    std::array<id<MTLBuffer>, Graphics::MAX_FRAMES_IN_FLIGHT> gravityBuf;
 
     id<MTLBuffer> gridVB = nil;
     id<MTLBuffer> gridIB = nil;
@@ -82,45 +73,9 @@ struct MetalEngine::Impl {
     id<MTLTexture> msaaColorTex = nil;
     NSUInteger sampleCount = 4;  // 4x MSAA for smooth edges
     dispatch_semaphore_t inflight;
-    
-    // Adaptive quality system - dynamically adjusts render scale for target FPS
-    struct AdaptiveQuality {
-        float targetFrameTimeMs = 16.67f;  // 60 FPS target
-        float currentFrameTimeMs = 20.0f;
-        float renderScale = 0.25f;  // Start at quarter res
-        int measurementCount = 0;
-        std::chrono::high_resolution_clock::time_point lastFrameTime;
-        
-        AdaptiveQuality() : lastFrameTime(std::chrono::high_resolution_clock::now()) {}
-        
-        void updateFrameTime() {
-            auto now = std::chrono::high_resolution_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastFrameTime);
-            currentFrameTimeMs = elapsed.count() / 1000.0f;
-            lastFrameTime = now;
-            measurementCount++;
-        }
-        
-        void adjustQuality() {
-            // Only adjust after warmup period
-            if (measurementCount < 30) return;
-            
-            if (currentFrameTimeMs > targetFrameTimeMs * 1.15f) {
-                // Too slow, reduce quality
-                renderScale = std::max(0.15f, renderScale * 0.95f);
-            } else if (currentFrameTimeMs < targetFrameTimeMs * 0.85f) {
-                // Headroom, increase quality
-                renderScale = std::min(0.5f, renderScale * 1.02f);
-            }
-        }
-        
-        std::pair<int, int> getResolution(int width, int height) const {
-            return {
-                static_cast<int>(width * renderScale),
-                static_cast<int>(height * renderScale)
-            };
-        }
-    } adaptiveQuality;
+
+    // Shared adaptive quality (see GraphicsCommon.hpp)
+    AdaptiveQuality adaptiveQuality;
 
     Impl(int w, int h, int cw, int ch)
     : WIDTH(w), HEIGHT(h), COMPUTE_WIDTH(cw), COMPUTE_HEIGHT(ch)
@@ -150,7 +105,7 @@ struct MetalEngine::Impl {
         nswin.contentView.wantsLayer = YES;
         nswin.contentView.layer = layer;
 
-        inflight = dispatch_semaphore_create(MAX_FRAMES_IN_FLIGHT);
+        inflight = dispatch_semaphore_create(Graphics::MAX_FRAMES_IN_FLIGHT);
 
         // C++20: Range-based initialization for cleaner code
         for (auto& buf : cameraBuf) {
@@ -410,56 +365,22 @@ struct MetalEngine::Impl {
 
     void uploadCamera(const Camera& cam, int frameIndex, int computeWidth, int computeHeight) {
         CameraUBO* data = (CameraUBO*)cameraBuf[frameIndex].contents;
-        simd_float3 fwd = simd_normalize(simd_float3{cam.target.x, cam.target.y, cam.target.z} - simd_float3{cam.position().x, cam.position().y, cam.position().z});
-        simd_float3 up  = {0,1,0};
-        simd_float3 right = simd_normalize(simd_cross(fwd, up));
-        up = simd_cross(right, fwd);
-
-        glm::vec3 pos = cam.position();
-        data->camPos     = simd_float3{pos.x, pos.y, pos.z};
-        data->camRight   = right;
-        data->camUp      = up;
-        data->camForward = fwd;
-        data->tanHalfFov = tanf(glm::radians(60.0f * 0.5f));
-        // CRITICAL: Aspect ratio must match compute texture dimensions, not window dimensions
-        // The shader uses compute texture size to calculate ray directions
-        data->aspect     = float(computeWidth)/float(computeHeight);
-        data->moving     = (cam.dragging || cam.panning) ? 1u : 0u;
-        data->time       = static_cast<float>(glfwGetTime());  // For animated effects
+        engine::fillCameraUBO(data, cam, computeWidth, computeHeight, static_cast<float>(glfwGetTime()));
     }
 
     void uploadDisk(int frameIndex) {
         DiskUBO* d = (DiskUBO*)diskBuf[frameIndex].contents;
-        // Disk parameters matching C implementation
-        // Note: Black hole Schwarzschild radius from scene
-        float r_s = scene.blackHole().r_s;
-        d->disk_r1 = r_s * 2.2f;   // From C: BLACK_HOLE_SCHWARZSCHILD_RADIUS * 2.2f
-        d->disk_r2 = r_s * 5.2f;   // From C: BLACK_HOLE_SCHWARZSCHILD_RADIUS * 5.2f
-        d->disk_num = 2.0f;
-        d->thickness = 1e9f;
+        engine::fillDiskUBO(d, scene.blackHole().r_s);
     }
 
     void uploadObjects(const std::vector<ObjectData>& objs, int frameIndex) {
         auto* o = static_cast<ObjectsUBO*>(objectsBuf[frameIndex].contents);
-        
-        // C++17: constexpr for compile-time limit
-        constexpr size_t maxObjects = 16;
-        const size_t count = std::min(objs.size(), maxObjects);
-        
-        o->numObjects = static_cast<int>(count);
-        
-        // C++20: Could use std::span<const ObjectData> for safer iteration
-        for (size_t i = 0; i < count; ++i) {
-            o->objPosRadius[i] = objs[i].posRadius;
-            o->objColor[i]     = objs[i].color;
-            o->mass[i]         = objs[i].mass;
-        }
+        engine::fillObjectsUBO(o, objs);
     }
 
     void uploadGravityData(const std::vector<ObjectData>& objs, int frameIndex) {
         auto* g = static_cast<GravityBuffer*>(gravityBuf[frameIndex].contents);
-        constexpr size_t maxObjects = 16;
-        const size_t count = std::min(objs.size(), maxObjects);
+        const size_t count = std::min(objs.size(), engine::MAX_OBJECTS);
         
         g->numObjects = static_cast<int>(count);
         
@@ -685,7 +606,7 @@ struct MetalEngine::Impl {
                const simd_float4x4& viewProj, bool gravityEnabled) {
         dispatch_semaphore_wait(inflight, DISPATCH_TIME_FOREVER);
         static int frameIndex = 0;
-        frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
+        frameIndex = (frameIndex + 1) % Graphics::MAX_FRAMES_IN_FLIGHT;
 
         // ADAPTIVE QUALITY: Dynamically adjust resolution to maintain target FPS
         adaptiveQuality.updateFrameTime();

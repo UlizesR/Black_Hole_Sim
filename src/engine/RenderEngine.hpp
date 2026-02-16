@@ -1,6 +1,7 @@
 // RenderEngine.hpp - CRTP Base class for render backends
 #pragma once
 
+#include "GraphicsCommon.hpp"
 #include <vector>
 #include <cstdint>
 #include <type_traits>
@@ -87,14 +88,3 @@ private:
         return static_cast<const Derived&>(*this);
     }
 };
-
-// ============================================================================
-// Quality Preset Constants (shared across backends)
-// ============================================================================
-
-namespace QualityPreset {
-    inline constexpr int FAST = 0;       // ~100 FPS, 3-4k steps
-    inline constexpr int MEDIUM = 1;     // ~50 FPS, 6-8k steps
-    inline constexpr int CINEMATIC = 2;  // ~20 FPS, 15-20k steps
-}
-

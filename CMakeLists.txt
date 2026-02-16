@@ -48,9 +48,11 @@ set(MAIN_SOURCES
     src/main.cpp
 )
 
-# Engine (CRTP base + Metal backend)
+# Engine (shared + backend-specific)
 set(ENGINE_SOURCES
+    src/engine/GraphicsCommon.hpp
     src/engine/RenderEngine.hpp
+    src/engine/UniformUpload.hpp
     src/engine/MetalEngine.hpp
 )
 
